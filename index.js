@@ -1,85 +1,133 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const mongoose = require('mongoose');
+const DataModel = require('./dataModel'); // Path to the schema file
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+mongoose.connect(process.env.DATABASE_URL, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+});
+
+const db = mongoose.connection;
+
+db.on('error', console.error.bind(console, 'MongoDB connection error:'));
+db.once('open', () => {
+    console.log('Connected to MongoDB');
+});
+
 app.use(bodyParser.json());
 
-// Simulated in-memory storage for events, opensByCountries, opensByDevice, and timeseries
-const eventsStorage = [];
-const opensByCountries = {};
-const opensByDevice = {};
-const timeseriesMap = {};
-
 // Endpoint for receiving real-time events
-app.post('/events', (req, res) => {
-  const event = req.body;
-  eventsStorage.push(event);
+app.post('/events', async (req, res) => {
+    const event = req.body;
+    try {
+        // Find the default data document
+        let data = await DataModel.findOne();
+        const country = event.geo_ip.country;
+        const deviceType = event.user_agent_parsed.device_family.toLowerCase();
+        const timestamp = parseInt(event.timestamp) * 1000;
+        const roundedTime = new Date(Math.floor(timestamp / 60000) * 60000).toLocaleString('en-US');
 
-  // Aggregating opens by countries
-  const country = event.geo_ip.country;
-  opensByCountries[country] = (opensByCountries[country] || 0) + 1;
 
-  // Aggregating opens by device
-  const deviceType = event.user_agent_parsed.device_family.toLowerCase();
-  opensByDevice[deviceType] = (opensByDevice[deviceType] || 0) + 1;
+        if (!data) {
+            // If no data found, create a new default document
+            data = new DataModel({
+                opens_by_device: {},
+                opens_by_countries: {},
+                timeseries: []
+            });
+        }
 
-  // Extracting and formatting the timestamp
-  const timestamp = parseInt(event.timestamp) * 1000;
-  const roundedTime = new Date(Math.floor(timestamp / 60000) * 60000).toLocaleString('en-US');
+        if (deviceType) {
+            data.opens_by_device.set(deviceType, (data.opens_by_device.get(deviceType) || 0) + 1);
+        }
 
-  // Filling gaps in timeseriesMap
-  if (!timeseriesMap[roundedTime]) {
-    fillTimeSeriesGaps(roundedTime);
-  }
+        // Update opens_by_countries field
+        if (country) {
+            data.opens_by_countries.set(country, (data.opens_by_countries.get(country) || 0) + 1);
+        }
+        try {
+            const existingDataPoint = data.timeseries.find(point => point.time.toLocaleString('en-US') === roundedTime);
+            if (existingDataPoint) {
+                // If exists, update the totalOpens count
+                existingDataPoint.totalOpens += 1;
+            } else {
+                // If not, create a new time series data point
+                fillTimeSeriesGaps(roundedTime, data);
+                data.timeseries.push({
+                    time: roundedTime,
+                    totalOpens: 1
+                });
+            }
 
-  // Increment timeseriesMap value
-  timeseriesMap[roundedTime] = (timeseriesMap[roundedTime] || 0) + 1;
+            // Save the updated data
+        }
+        catch {
+            data.timeseries.push({
+                time: roundedTime,
+                totalOpens: 1
+            });
+        }
+        await data.save();
 
-  res.status(201).json({ message: 'Event received successfully' });
+        res.status(200).json({ message: 'Data updated successfully.' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'An error occurred.' });
+    }
 });
 
 // Function to fill gaps in timeseriesMap
-function fillTimeSeriesGaps(roundedTime) {
-  const timestamps = Object.keys(timeseriesMap).map(time => new Date(time).getTime());
-  const minTimestamp = Math.min(...timestamps);
-  const maxTimestamp = Math.max(...timestamps);
-
-  for (let timestamp = minTimestamp; timestamp <= maxTimestamp; timestamp += 60000) {
-    const time = new Date(Math.floor(timestamp / 60000) * 60000).toLocaleString('en-US');
-    if (!timeseriesMap[time]) {
-      timeseriesMap[time] = 0;
+function fillTimeSeriesGaps(roundedTime, data) {
+    if (data.timeseries === []) {
+        return;
     }
-
-    if (time === roundedTime) {
-      break;
+    const maxTimestamp = Date.parse(data.timeseries[data.timeseries.length - 1].time);
+    if (maxTimestamp !== roundedTime) {
+        for (let timestamp = (maxTimestamp + 60000); timestamp <= Date.parse(roundedTime) - 60000; timestamp += 60000) {
+            const time = new Date(Math.floor(timestamp / 60000) * 60000).toLocaleString('en-US');
+            data.timeseries.push({
+                time: time,
+                totalOpens: 0
+            });
+        }
     }
-  }
 }
 
 // Endpoint for aggregating metrics
-app.get('/metrics', (req, res) => {
-  // Fill gaps in timeseriesMap before responding
-  const timestamps = Object.keys(timeseriesMap);
-  timestamps.forEach(time => {
-    fillTimeSeriesGaps(time);
-  });
+app.get('/metrics', async (req, res) => {
+    try {
+        // Find the default data document
+        const data = await DataModel.findOne();
 
-  const timeseries = Object.keys(timeseriesMap).map(time => ({ totalOpens: timeseriesMap[time], time }));
+        if (!data) {
+            res.status(404).json({ message: 'No data found.' });
+            return;
+        }
 
-  // Sort the timeseries array by time
-  timeseries.sort((a, b) => new Date(a.time) - new Date(b.time));
+        // Prepare the response structure
+        const response = {
+            opens_by_countries: data.opens_by_countries,
+            opens_by_device: data.opens_by_device,
+            timeseries: data.timeseries.map(point => ({
+                totalOpens: point.totalOpens,
+                time: point.time.toLocaleString('en-US', { timeZone: 'UTC' })
+            }))
+        };
 
-  res.json({
-    opens_by_countries: opensByCountries,
-    opens_by_device: opensByDevice,
-    timeseries: timeseries
-  });
+        res.status(200).json(response);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'An error occurred.' });
+    }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+    console.log(`Server is running on port ${PORT}`);
 });
 
 module.exports = app;
